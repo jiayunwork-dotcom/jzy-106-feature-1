@@ -1,0 +1,14 @@
+services:
+  attitude:
+    build:
+      context: .
+      args:
+        # If proxy.golang.org is unreachable from the build host:
+        #   docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
+        GOPROXY: https://proxy.golang.org,direct
+    image: attitude-quaternion-integrator:latest
+    ports:
+      - "8080:8080"
+    environment:
+      ATTITUDE_HTTP_ADDR: ":8080"
+    restart: unless-stopped

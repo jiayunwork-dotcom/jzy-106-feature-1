@@ -1,0 +1,11 @@
+# build artifacts
+/attitude-server
+/out
+*.test
+*.out
+
+# local tooling / VCS
+.git
+.gitignore
+Dockerfile
+docker-compose.yml
