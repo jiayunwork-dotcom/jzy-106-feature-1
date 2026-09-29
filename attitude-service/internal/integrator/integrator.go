@@ -11,7 +11,6 @@ package integrator
 
 import (
 	"errors"
-	"math"
 	"strconv"
 
 	"github.com/example/attitude-service/internal/quaternion"
@@ -145,67 +144,33 @@ func rk4Step(q quaternion.Q, a, b Sample, h float64) quaternion.Q {
 // input (lengths, non-positive steps, unit initial quaternion) is the
 // validation package's responsibility; this function assumes well-formed
 // inputs but still guards every step duration.
+//
+// The whole run is executed through the incremental Stepper; nothing here
+// duplicates the step math. This guarantees that a stateful trajectory
+// appending the same samples reaches a bit-for-bit identical final quaternion.
 func Simulate(q0 quaternion.Q, samples []Sample, opts Options) (*Result, error) {
 	if len(samples) == 0 {
 		return nil, ErrNoSamples
 	}
-	threshold := opts.MaxStepNormDrift
-	if threshold <= 0 {
-		threshold = DefaultMaxStepNormDrift
-	}
 
+	st := NewStepper(q0, opts)
 	res := &Result{
 		Initial: q0,
 		Final:   q0,
 		Steps:   make([]StepRecord, 0, len(samples)),
 	}
 
-	q := q0
 	for i := 1; i < len(samples); i++ {
-		a, b := samples[i-1], samples[i]
-		h := b.T - a.T
-		if !(h > 0) { // rejects h <= 0 and NaN durations alike
-			return nil, ErrNonPositiveStep
+		rec, err := st.Advance(samples[i-1], samples[i])
+		if err != nil {
+			return nil, err
 		}
-
-		raw := rk4Step(q, a, b, h)
-		rawNorm := quaternion.Norm(raw)
-		drift := math.Abs(rawNorm - 1.0)
-		if drift > res.MaxDrift {
-			res.MaxDrift = drift
-		}
-
-		if drift > threshold {
-			if opts.StrictDrift {
-				return nil, &DriftError{Step: i, Drift: drift, Threshold: threshold}
-			}
-			if len(res.Warnings) < maxWarnings {
-				res.Warnings = append(res.Warnings, "step "+itoa(i)+
-					": quaternion norm drift "+formatFloat(drift)+
-					" exceeded threshold "+formatFloat(threshold)+
-					" (quaternion was renormalized; consider smaller steps)")
-			}
-		}
-
-		nq, ok := quaternion.Normalized(raw)
-		if !ok {
-			return nil, ErrZeroQuaternion
-		}
-		q = nq
-
-		wEnd := b.W
-		speed := math.Sqrt(wEnd[0]*wEnd[0] + wEnd[1]*wEnd[1] + wEnd[2]*wEnd[2])
-		res.Steps = append(res.Steps, StepRecord{
-			T:            b.T,
-			Quaternion:   q,
-			NormBefore:   rawNorm,
-			NormDrift:    drift,
-			StepDuration: h,
-			AngularSpeed: speed,
-		})
+		res.Steps = append(res.Steps, rec)
 	}
 
-	res.Final = q
+	res.Final = st.Attitude()
+	res.MaxDrift = st.MaxDrift()
+	res.Warnings = st.Warnings()
 	res.ElapsedTime = samples[len(samples)-1].T - samples[0].T
 	return res, nil
 }
