@@ -158,30 +158,23 @@ func (s *Server) integrate(c *gin.Context) {
 		return
 	}
 
-	ea := euler.FromQuaternion(res.Final.W, res.Final.X, res.Final.Y, res.Final.Z)
-	warnings := res.Warnings
-	if warnings == nil {
-		warnings = []string{}
-	}
+	eaNote := ""
 	if len(in.Samples) == 1 {
-		warnings = append(warnings, "序列仅含 1 个采样，没有可推进的时间步，姿态保持为初始姿态")
+		eaNote = "序列仅含 1 个采样，没有可推进的时间步，姿态保持为初始姿态"
 	}
 
-	c.JSON(http.StatusOK, integrateResponse{
-		QuaternionConvention: convention(),
-		InitialQuaternion:    quatArr(res.Initial),
-		FinalQuaternion:      quatArr(res.Final),
-		EulerAngles: eulerJSON{
-			Roll: ea.Roll, Pitch: ea.Pitch, Yaw: ea.Yaw,
-			RollDeg: ea.Roll * radToDeg, PitchDeg: ea.Pitch * radToDeg, YawDeg: ea.Yaw * radToDeg,
-			Singular: ea.Singular, NearSingular: ea.NearSingular, Note: ea.Note,
-		},
-		SampleCount:        len(in.Samples),
-		StepCount:          len(res.Steps),
-		ElapsedTime:        res.ElapsedTime,
-		MaxNormDrift:       res.MaxDrift,
-		NormDriftThreshold: in.MaxStepNormDrift,
-		NormalizedEachStep: true,
-		Warnings:           warnings,
+	resp := s.attitudeResponse(attitudeView{
+		Initial:         res.Initial,
+		Final:           res.Final,
+		SampleCount:     len(in.Samples),
+		StepCount:       len(res.Steps),
+		ElapsedTime:     res.ElapsedTime,
+		MaxNormDrift:    res.MaxDrift,
+		NormDriftThresh: in.MaxStepNormDrift,
+		Warnings:        res.Warnings,
 	})
+	if eaNote != "" {
+		resp.Warnings = append(resp.Warnings, eaNote)
+	}
+	c.JSON(http.StatusOK, resp)
 }

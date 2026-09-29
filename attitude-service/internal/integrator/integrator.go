@@ -57,12 +57,26 @@ type Result struct {
 	Warnings    []string
 }
 
+// SegmentResult is the outcome of advancing over one contiguous segment (see
+// Advance). Unlike Result.Warnings, Warnings here is NOT capped: every
+// threshold breach in the segment is reported. Callers that need the
+// one-shot-run behaviour truncate at MaxWarnings themselves.
+type SegmentResult struct {
+	Final     quaternion.Q
+	Steps     []StepRecord
+	MaxDrift  float64
+	Warnings  []string
+	threshold float64
+}
+
 // DefaultMaxStepNormDrift is used when no explicit threshold is supplied.
 const DefaultMaxStepNormDrift = 1e-4
 
-const maxWarnings = 20
+// MaxWarnings is the number of drift warnings retained by a single one-shot
+// Simulate run (and by a whole trajectory).
+const MaxWarnings = 20
 
-// Errors returned by Simulate.
+// Errors returned by Simulate / Advance.
 var (
 	ErrNoSamples       = errors.New("angular velocity series is empty")
 	ErrNonPositiveStep = errors.New("time step is non-positive")
@@ -71,6 +85,8 @@ var (
 )
 
 // DriftError wraps ErrDriftThreshold with the offending step's diagnostics.
+// Step is the GLOBAL step index: for Simulate it starts at 1; for Advance it
+// is stepOffset plus the segment-local index.
 type DriftError struct {
 	Step      int
 	Drift     float64
@@ -95,6 +111,24 @@ func omegaAt(a, b Sample, t float64) [3]float64 {
 		w[i] = a.W[i] + u*(b.W[i]-a.W[i])
 	}
 	return w
+}
+
+// LinearRateAt returns the body angular velocity obtained by the integrator's
+// linear interpolation between a and b at time t. It is exported so callers
+// (e.g. trajectory history queries) can construct the exact virtual sample
+// the kernel itself would see, then run that sample through the same kernel.
+func LinearRateAt(a, b Sample, t float64) [3]float64 {
+	return omegaAt(a, b, t)
+}
+
+// DriftWarning renders the canonical warning text for a threshold breach at
+// the given (global) step. The kernel uses this exact wording, and stateful
+// trajectories reuse it when rebuilding warnings after a late re-integration.
+func DriftWarning(step int, drift, threshold float64) string {
+	return "step " + itoa(step) +
+		": quaternion norm drift " + formatFloat(drift) +
+		" exceeded threshold " + formatFloat(threshold) +
+		" (quaternion was renormalized; consider smaller steps)"
 }
 
 // qdot evaluates the quaternion rate q̇ = 1/2 q ⊗ (0, ω_b).
@@ -141,61 +175,60 @@ func rk4Step(q quaternion.Q, a, b Sample, h float64) quaternion.Q {
 	}
 }
 
-// Simulate integrates the attitude from q0 along samples. Validation of the
-// input (lengths, non-positive steps, unit initial quaternion) is the
-// validation package's responsibility; this function assumes well-formed
-// inputs but still guards every step duration.
-func Simulate(q0 quaternion.Q, samples []Sample, opts Options) (*Result, error) {
-	if len(samples) == 0 {
-		return nil, ErrNoSamples
+// Advance integrates from an already-attained attitude q along segment, where
+// segment[0] is the bracketing anchor sample (it produces no step) and every
+// later sample produces one step. It is the single reusable stepping core of
+// the package: both one-shot Simulate and the stateful trajectory package go
+// through exactly these RK4 steps, so incremental continuation and late
+// re-integration are bit-for-bit identical to a one-shot run.
+//
+// stepOffset is the number of steps already integrated before segment[0];
+// diagnostics (DriftError.Step, warning step numbers) use global step indices
+// stepOffset+1, stepOffset+2, ... . segment[0] and q typically come from a
+// previously archived post-step state, which is why a recomputation never has
+// to start at the initial attitude.
+func Advance(q quaternion.Q, segment []Sample, opts Options, stepOffset int) (SegmentResult, error) {
+	var seg SegmentResult
+	if len(segment) == 0 {
+		return seg, ErrNoSamples
 	}
 	threshold := opts.MaxStepNormDrift
 	if threshold <= 0 {
 		threshold = DefaultMaxStepNormDrift
 	}
+	seg.threshold = threshold
+	seg.Steps = make([]StepRecord, 0, len(segment)-1)
 
-	res := &Result{
-		Initial: q0,
-		Final:   q0,
-		Steps:   make([]StepRecord, 0, len(samples)),
-	}
-
-	q := q0
-	for i := 1; i < len(samples); i++ {
-		a, b := samples[i-1], samples[i]
+	for i := 1; i < len(segment); i++ {
+		a, b := segment[i-1], segment[i]
 		h := b.T - a.T
 		if !(h > 0) { // rejects h <= 0 and NaN durations alike
-			return nil, ErrNonPositiveStep
+			return seg, ErrNonPositiveStep
 		}
 
 		raw := rk4Step(q, a, b, h)
 		rawNorm := quaternion.Norm(raw)
 		drift := math.Abs(rawNorm - 1.0)
-		if drift > res.MaxDrift {
-			res.MaxDrift = drift
+		if drift > seg.MaxDrift {
+			seg.MaxDrift = drift
 		}
 
 		if drift > threshold {
 			if opts.StrictDrift {
-				return nil, &DriftError{Step: i, Drift: drift, Threshold: threshold}
+				return seg, &DriftError{Step: stepOffset + i, Drift: drift, Threshold: threshold}
 			}
-			if len(res.Warnings) < maxWarnings {
-				res.Warnings = append(res.Warnings, "step "+itoa(i)+
-					": quaternion norm drift "+formatFloat(drift)+
-					" exceeded threshold "+formatFloat(threshold)+
-					" (quaternion was renormalized; consider smaller steps)")
-			}
+			seg.Warnings = append(seg.Warnings, DriftWarning(stepOffset+i, drift, threshold))
 		}
 
 		nq, ok := quaternion.Normalized(raw)
 		if !ok {
-			return nil, ErrZeroQuaternion
+			return seg, ErrZeroQuaternion
 		}
 		q = nq
 
 		wEnd := b.W
 		speed := math.Sqrt(wEnd[0]*wEnd[0] + wEnd[1]*wEnd[1] + wEnd[2]*wEnd[2])
-		res.Steps = append(res.Steps, StepRecord{
+		seg.Steps = append(seg.Steps, StepRecord{
 			T:            b.T,
 			Quaternion:   q,
 			NormBefore:   rawNorm,
@@ -205,8 +238,39 @@ func Simulate(q0 quaternion.Q, samples []Sample, opts Options) (*Result, error) 
 		})
 	}
 
-	res.Final = q
-	res.ElapsedTime = samples[len(samples)-1].T - samples[0].T
+	seg.Final = q
+	return seg, nil
+}
+
+// Threshold reports the effective drift threshold of a completed segment.
+func (seg *SegmentResult) Threshold() float64 { return seg.threshold }
+
+// Simulate integrates the attitude from q0 along samples. Validation of the
+// input (lengths, non-positive steps, unit initial quaternion) is the
+// validation package's responsibility; this function assumes well-formed
+// inputs but still guards every step duration.
+func Simulate(q0 quaternion.Q, samples []Sample, opts Options) (*Result, error) {
+	if len(samples) == 0 {
+		return nil, ErrNoSamples
+	}
+
+	seg, err := Advance(q0, samples, opts, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &Result{
+		Initial:     q0,
+		Final:       seg.Final,
+		Steps:       seg.Steps,
+		MaxDrift:    seg.MaxDrift,
+		ElapsedTime: samples[len(samples)-1].T - samples[0].T,
+	}
+	if len(seg.Warnings) > MaxWarnings {
+		res.Warnings = seg.Warnings[:MaxWarnings]
+	} else {
+		res.Warnings = seg.Warnings
+	}
 	return res, nil
 }
 

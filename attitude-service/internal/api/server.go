@@ -9,16 +9,18 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/example/attitude-service/internal/store"
+	"github.com/example/attitude-service/internal/trajectory"
 )
 
 // Server bundles the dependencies shared by every handler.
 type Server struct {
-	store *store.SeriesStore
+	store        *store.SeriesStore
+	trajectories *trajectory.Manager
 }
 
 // NewServer constructs the HTTP layer.
 func NewServer(st *store.SeriesStore) *Server {
-	return &Server{store: st}
+	return &Server{store: st, trajectories: trajectory.NewManager()}
 }
 
 // Router builds the gin engine with every route wired up.
@@ -36,6 +38,13 @@ func (s *Server) Router() *gin.Engine {
 		v1.GET("/series", s.listSeries)
 		v1.GET("/series/:name", s.getSeries)
 		v1.DELETE("/series/:name", s.deleteSeries)
+
+		v1.POST("/trajectories", s.createTrajectory)
+		v1.GET("/trajectories", s.listTrajectories)
+		v1.GET("/trajectories/:id", s.getTrajectory)
+		v1.DELETE("/trajectories/:id", s.closeTrajectory)
+		v1.POST("/trajectories/:id/packets", s.appendPacket)
+		v1.GET("/trajectories/:id/attitude", s.queryAttitude)
 	}
 	return r
 }

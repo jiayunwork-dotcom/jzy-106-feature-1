@@ -67,56 +67,88 @@ func ValidateIntegrate(
 ) (IntegrateInput, error) {
 	var in IntegrateInput
 
-	q := quaternion.Q{W: q0[0], X: q0[1], Y: q0[2], Z: q0[3]}
-	if !quaternion.IsFinite(q) {
-		return in, NewError(CauseInvalidQuaternion,
-			"初始四元数含 NaN 或无穷大分量")
+	q, err := ValidateInitialQuaternion(q0)
+	if err != nil {
+		return in, err
 	}
-	if !quaternion.IsUnit(q, UnitTolerance) {
-		return in, NewErrorf(CauseInvalidQuaternion,
-			"初始四元数不是单位四元数: |q0|=%g, 要求 | |q0|-1 | <= %g",
-			quaternion.Norm(q), UnitTolerance)
-	}
-	q0n, _ := quaternion.Normalized(q)
 
 	if len(rates) == 0 {
 		return in, NewError(CauseEmptySequence, "角速度序列为空: 至少需要一个采样")
 	}
 
+	samples, err := ValidateRateSequence(rates)
+	if err != nil {
+		return in, err
+	}
+
+	threshold, err := ValidateThreshold(maxDrift)
+	if err != nil {
+		return in, err
+	}
+
+	in.Q0 = q
+	in.Samples = samples
+	in.MaxStepNormDrift = threshold
+	in.StrictDrift = strict
+	return in, nil
+}
+
+// ValidateInitialQuaternion applies the shared initial-attitude rule: all
+// components finite and | |q|-1 | <= UnitTolerance. The returned quaternion is
+// renormalized. Both one-shot integration and trajectory creation use it.
+func ValidateInitialQuaternion(q0 [4]float64) (quaternion.Q, error) {
+	q := quaternion.Q{W: q0[0], X: q0[1], Y: q0[2], Z: q0[3]}
+	if !quaternion.IsFinite(q) {
+		return quaternion.Q{}, NewError(CauseInvalidQuaternion,
+			"初始四元数含 NaN 或无穷大分量")
+	}
+	if !quaternion.IsUnit(q, UnitTolerance) {
+		return quaternion.Q{}, NewErrorf(CauseInvalidQuaternion,
+			"初始四元数不是单位四元数: |q0|=%g, 要求 | |q0|-1 | <= %g",
+			quaternion.Norm(q), UnitTolerance)
+	}
+	qn, _ := quaternion.Normalized(q)
+	return qn, nil
+}
+
+// ValidateRateSequence applies the shared per-sample rules: every timestamp
+// and rate component finite, timestamps strictly increasing (every step
+// strictly positive). Both one-shot integration and every trajectory packet
+// pass through it, so neither path can admit data the other rejects.
+func ValidateRateSequence(rates []AngularRate) ([]integrator.Sample, error) {
 	samples := make([]integrator.Sample, len(rates))
 	for i, r := range rates {
 		if math.IsNaN(r.T) || math.IsInf(r.T, 0) {
-			return in, NewErrorf(CauseInvalidTimestamp,
+			return nil, NewErrorf(CauseInvalidTimestamp,
 				"第 %d 个采样的时间戳为 NaN 或无穷大", i)
 		}
 		if !isFinite3(r.W) {
-			return in, NewErrorf(CauseInvalidRate,
+			return nil, NewErrorf(CauseInvalidRate,
 				"第 %d 个采样的角速度含 NaN 或无穷大分量", i)
 		}
 		samples[i] = integrator.Sample{T: r.T, W: r.W}
 		if i > 0 {
 			h := r.T - rates[i-1].T
 			if h <= 0 {
-				return in, NewErrorf(CauseNonPositiveStep,
+				return nil, NewErrorf(CauseNonPositiveStep,
 					"第 %d 个采样的时间步长非正: dt=%.12g (时间戳必须严格递增)", i, h)
 			}
 		}
 	}
+	return samples, nil
+}
 
-	threshold := integrator.DefaultMaxStepNormDrift
-	if maxDrift != nil {
-		if math.IsNaN(*maxDrift) || math.IsInf(*maxDrift, 0) || *maxDrift <= 0 {
-			return in, NewError(CauseInvalidThreshold,
-				"单步范数漂移阈值必须是正数")
-		}
-		threshold = *maxDrift
+// ValidateThreshold applies the shared drift-threshold rule: absent means the
+// built-in default; present means a positive finite number.
+func ValidateThreshold(maxDrift *float64) (float64, error) {
+	if maxDrift == nil {
+		return integrator.DefaultMaxStepNormDrift, nil
 	}
-
-	in.Q0 = q0n
-	in.Samples = samples
-	in.MaxStepNormDrift = threshold
-	in.StrictDrift = strict
-	return in, nil
+	if math.IsNaN(*maxDrift) || math.IsInf(*maxDrift, 0) || *maxDrift <= 0 {
+		return 0, NewError(CauseInvalidThreshold,
+			"单步范数漂移阈值必须是正数")
+	}
+	return *maxDrift, nil
 }
 
 // ValidateSeries checks a store/save payload: a legal name and a legal,
@@ -166,6 +198,16 @@ const (
 	CauseInvalidThreshold  Cause = "invalid_threshold"
 	CauseInvalidName       Cause = "invalid_name"
 	CauseNotFound          Cause = "not_found"
+
+	// Causes used only by the stateful trajectory API.
+	CauseTrajectoryNotFound  Cause = "trajectory_not_found"
+	CauseInvalidPacket       Cause = "invalid_packet"
+	CauseDuplicateTimestamp  Cause = "duplicate_timestamp"
+	CausePacketConflict      Cause = "packet_conflict"
+	CauseVersionConflict     Cause = "version_conflict"
+	CauseLatePacketTooOld    Cause = "late_packet_out_of_window"
+	CauseOutOfRangeQuery     Cause = "query_out_of_range"
+	CauseInvalidTrajectoryID Cause = "invalid_trajectory_id"
 )
 
 // Error is a validation error carrying a stable cause and a Chinese message.
