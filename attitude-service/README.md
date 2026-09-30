@@ -20,13 +20,16 @@
 ## 目录结构（按职责分文件，四元数代数与积分推进严格分开）
 
 ```
-cmd/server/main.go                  进程入口：装配依赖、启动 HTTP
-internal/quaternion/quaternion.go   四元数代数：乘法、共轭、归一化、单位判定
-internal/integrator/integrator.go   RK4 推进、逐步归一化、单步范数漂移阈值
-internal/euler/euler.go             四元数→ZYX 欧拉角 + 奇异检测
-internal/store/store.go             命名角速度序列的内存存取（带拷贝隔离）
-internal/validation/validation.go   请求参数合法性校验（带中文原因的错误码）
-internal/api/                       轻薄接口层：解析请求、驱动积分、组织返回
+cmd/server/main.go                    进程入口：装配依赖、启动 HTTP
+internal/quaternion/quaternion.go     四元数代数：乘法、共轭、归一化、单位判定
+internal/integrator/integrator.go     RK4 推进、逐步归一化、单步范数漂移阈值；
+                                      Simulate 与有状态轨迹共用同一个单步内核 Step
+internal/euler/euler.go               四元数→ZYX 欧拉角 + 奇异检测
+internal/store/store.go               命名角速度序列的内存存取（带拷贝隔离）
+internal/trajectory/trajectory.go     有状态轨迹：按包追加、时间合并、存档回溯、
+                                      补传窗口、重传幂等、版本号、轨迹注册表
+internal/validation/validation.go     请求参数合法性校验（带中文原因的错误码）
+internal/api/                         轻薄接口层：解析请求、组织返回
 ```
 
 ## 一条命令构建并启动
@@ -113,6 +116,107 @@ curl -X DELETE localhost:8080/api/v1/series/bench-yaw     # 删除
 
 存取均做深拷贝：并发积分引用同一命名序列时互不影响，调用方也无法改写已存数据。
 
+## 有状态轨迹（按包追加，晚到自动认回）
+
+地面站一包一包下采样，没必要每包都从头重积。开一条**轨迹**之后，可以按包
+追加采样：服务接着上一次的末端姿态往下推；晚到的补传包按时间戳插回正确
+位置，只从插入点之前最近的一个存档往后重算，绝不从头积分。轨迹只放在
+进程内存中，服务重启即失效。
+
+运动学和校验与一次性积分完全同一份代码：轨迹的每一步都走
+`integrator.Step`（`Simulate` 内部也调用它），历史时刻插值用的也是
+`integrator.InterpolatedRate`，所以切包边界落在任何位置、包多乱序，最终
+姿态都与合并后整段一次性提交**逐位相同**。
+
+### 1. 开轨迹 `POST /api/v1/trajectories`
+
+```bash
+curl -s -X POST localhost:8080/api/v1/trajectories \
+  -H 'Content-Type: application/json' -d '{
+    "q0": [1,0,0,0],
+    "max_step_norm_drift": 1e-4,
+    "strict_drift": false
+  }'
+# -> {"trajectory_id":"a91dda66...","version":0, "max_late_samples":200, ...}
+```
+
+`q0`、`max_step_norm_drift`、`strict_drift` 的含义、取值范围与一次性积分
+接口完全一致（非法初态/阈值用同样的 400 错误码拒绝）。
+
+### 2. 按包追加 `POST /api/v1/trajectories/:id/append`
+
+```bash
+curl -s -X POST localhost:8080/api/v1/trajectories/$TID/append \
+  -H 'Content-Type: application/json' -d '{
+    "packet_seq": 1,
+    "expected_version": 0,
+    "samples": [
+      {"t":0.0,"w":[0,0,0.5]},
+      {"t":0.1,"w":[0,0,0.5]}
+    ]
+  }'
+```
+
+- `packet_seq`（必填）：包序号。采样同样支持 `samples` 或
+  `timestamps`+`angular_velocities` 两种写法。
+- `expected_version`（可选）：调用方看到的轨迹版本号，做乐观并发控制；
+  对不上返回 409 `version_conflict`，整包不施加。
+- 返回内容与一次性积分同字段同义：`final_quaternion`、`euler_angles`
+  （含 `singular`/`near_singular`/`note`）、`max_norm_drift`、
+  `norm_drift_threshold`、`normalized_after_each_step`、`warnings`
+  （步号按**整条轨迹的全局步号**计），另加：
+  - `version`：每成功并入一个含新采样的包 +1（重传不增）；
+  - `duplicate_packet`：是否为幂等重传；
+  - `inserted_samples`：本包新并入的采样数；
+  - `recomputed_steps`：本次实际（重）积分的步数。
+
+**切包无关**：同一段采样任意切包按序追加（最小一包一个采样），末端四元数
+与整段提交逐位相同，跨包那一步的角速度插值与整段提交时相邻采样间的插值
+是同一函数。
+
+**晚到补传**：包内时间戳早于轨迹末尾时按时间插回，从插入点前最近存档往后
+重算，`recomputed_steps` 报实际重算步数（小于总步数），结果与合并序列
+整段提交逐位相同。补传只接受插入点之后现存采样不超过
+`max_late_samples`（=200）的包；更早的旧包返回 422
+`late_packet_out_of_window`，轨迹状态不动。
+
+**重传幂等 / 冲突**：
+
+| 情形 | 结果 |
+|------|------|
+| 同 `packet_seq`、内容相同 | `duplicate_packet=true`，不重复施加，版本/姿态不变 |
+| 整包采样都已存在且值一致（序号不同） | 同样按幂等重传处理 |
+| 同 `packet_seq`、内容不同 | 409 `packet_conflict`，整包拒绝 |
+| 时间戳已存在但角速度不一致 | 409 `timestamp_conflict`，detail 报出冲突时间戳 |
+
+**整包原子**：包内任一采样非法（时间步非正、NaN/Inf、包内时间戳重复/倒序
+等）返回 400；严格模式下本包（含重算尾部）任一步漂移超阈返回 422
+`norm_drift_exceeded`。两种情况下轨迹都回到收包前：末端姿态、步数、最大
+漂移、存档、版本不留半截痕迹。
+
+### 3. 历史时刻查询 `GET /api/v1/trajectories/:id/attitude?t=<秒>`
+
+- `t` 恰好是采样时刻：返回该时刻存档姿态，`exact_sample=true`；
+- 落在两采样之间：从前一个采样用同样的线性插值 + RK4 推进到 `t`
+  （`exact_sample=false`，`bracket_step` 给出所在全局步号），结果等于把
+  序列截到 `t`、在 `t` 处补一个按插值得出的采样后整段一次性提交的末端；
+- 超出 `[start_time_s, end_time_s]` 或不是数字：400
+  `time_out_of_range` / `invalid_timestamp`，并在 detail 给出当前覆盖范围。
+
+### 4. 查看 / 列表 / 关闭删除
+
+```bash
+curl   localhost:8080/api/v1/trajectories            # 列出全部 id
+curl   localhost:8080/api/v1/trajectories/$TID       # 查看状态（版本/步数/覆盖时间/最大漂移/已收包序号）
+curl -X DELETE localhost:8080/api/v1/trajectories/$TID   # 关闭并删除
+```
+
+对已删除（或重启后丢失）的 id 再追加/查询，返回 404 `trajectory_not_found`。
+
+**并发与隔离**：同一条轨迹的追加在轨迹内部串行化，并可再用
+`expected_version` 做乐观锁，不会出现两包从同一旧末端各自下推；不同轨迹
+之间状态、存档、告警、包序号互不影响。
+
 ## 非法输入（积分开始前拦截，HTTP 400，带 `cause` 与中文 `detail`）
 
 | cause | 触发条件 |
@@ -144,3 +248,13 @@ go test -race ./...      # 含数据竞争检查
 - `TestPureYawBenchmark`：纯绕竖直轴匀速旋转的手算基准，yaw 随时间线性增长、pitch/roll≈0，末端 yaw 钉死回归。
 - 另有四元数代数、欧拉角往返与万向锁标志、参数校验、严格/非严格漂移策略、
   命名序列存取拷贝隔离、HTTP 全链路及 100 路并发积分互不串状态等测试。
+- 有状态轨迹（`internal/trajectory` 与 HTTP 全链路）额外钉住：
+  - 200 组随机切包（含单采样包）与整段提交末端四元数、最大漂移逐位相同；
+  - 乱序补传合并后与整段提交逐位相同，且 `recomputed_steps` 小于总步数；
+    补传窗口 ±200 个采样的边界与超窗拒绝；
+  - 晚到插入后非严格告警的步号按全局步号重排，与一次性积分逐条一致；
+  - 同序号重传幂等、同序号异内容/同时刻异速率冲突被拒且状态不变；
+  - 严格模式下超阈包（含超阈发生在重算尾部）整体回滚；
+  - 中间时刻查询等于截断并补插值采样后整段提交，越界带原因拒绝；
+  - 同一轨迹并发追加不丢包、不重复施加，`expected_version` 乐观锁生效，
+    不同轨迹彼此隔离（全部在 `-race` 下通过）。

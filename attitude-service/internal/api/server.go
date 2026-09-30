@@ -9,16 +9,18 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/example/attitude-service/internal/store"
+	"github.com/example/attitude-service/internal/trajectory"
 )
 
 // Server bundles the dependencies shared by every handler.
 type Server struct {
-	store *store.SeriesStore
+	store        *store.SeriesStore
+	trajectories *trajectory.Registry
 }
 
 // NewServer constructs the HTTP layer.
 func NewServer(st *store.SeriesStore) *Server {
-	return &Server{store: st}
+	return &Server{store: st, trajectories: trajectory.NewRegistry()}
 }
 
 // Router builds the gin engine with every route wired up.
@@ -36,6 +38,14 @@ func (s *Server) Router() *gin.Engine {
 		v1.GET("/series", s.listSeries)
 		v1.GET("/series/:name", s.getSeries)
 		v1.DELETE("/series/:name", s.deleteSeries)
+
+		// Stateful, packet-driven trajectories.
+		v1.POST("/trajectories", s.createTrajectory)
+		v1.GET("/trajectories", s.listTrajectories)
+		v1.GET("/trajectories/:id", s.getTrajectory)
+		v1.DELETE("/trajectories/:id", s.deleteTrajectory)
+		v1.POST("/trajectories/:id/append", s.appendTrajectory)
+		v1.GET("/trajectories/:id/attitude", s.trajectoryAttitude)
 	}
 	return r
 }
@@ -106,6 +116,42 @@ type seriesRequest struct {
 	Samples           []sampleJSON `json:"samples"`
 	Timestamps        []float64    `json:"timestamps"`
 	AngularVelocities [][3]float64 `json:"angular_velocities"`
+}
+
+// createTrajectoryRequest opens a stateful trajectory. The packet/series
+// shapes mirror the one-shot endpoint but no samples are accepted at open
+// time: samples arrive via append.
+type createTrajectoryRequest struct {
+	Q0               [4]float64 `json:"q0"`
+	MaxStepNormDrift *float64   `json:"max_step_norm_drift"`
+	StrictDrift      bool       `json:"strict_drift"`
+}
+
+// appendTrajectoryRequest is one telemetry packet: its sequence number plus
+// the same three accepted sample shapes as elsewhere in the API.
+type appendTrajectoryRequest struct {
+	PacketSeq         *int64       `json:"packet_seq"`
+	ExpectedVersion   *int64       `json:"expected_version"`
+	Samples           []sampleJSON `json:"samples"`
+	Timestamps        []float64    `json:"timestamps"`
+	AngularVelocities [][3]float64 `json:"angular_velocities"`
+}
+
+type trajectoryJSON struct {
+	ID                 string     `json:"id"`
+	Version            int64      `json:"version"`
+	CreatedAt          string     `json:"created_at"`
+	InitialQuaternion  [4]float64 `json:"initial_quaternion"`
+	NormDriftThreshold float64    `json:"norm_drift_threshold"`
+	StrictDrift        bool       `json:"strict_drift"`
+	SampleCount        int        `json:"sample_count"`
+	StepCount          int        `json:"step_count"`
+	StartTime          *float64   `json:"start_time_s"`
+	EndTime            *float64   `json:"end_time_s"`
+	ElapsedTime        float64    `json:"elapsed_time_s"`
+	MaxNormDrift       float64    `json:"max_norm_drift"`
+	OpenForAppends     bool       `json:"open_for_appends"`
+	PacketSeqs         []int64    `json:"packet_seqs"`
 }
 
 func (s *Server) health(c *gin.Context) {

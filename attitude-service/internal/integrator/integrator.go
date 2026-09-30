@@ -60,7 +60,10 @@ type Result struct {
 // DefaultMaxStepNormDrift is used when no explicit threshold is supplied.
 const DefaultMaxStepNormDrift = 1e-4
 
-const maxWarnings = 20
+// MaxWarnings is the global cap on drift warnings kept for one continuous
+// integration. A stateful trajectory shares the same cap over the whole
+// trajectory so its warnings match a one-shot integration one-for-one.
+const MaxWarnings = 20
 
 // Errors returned by Simulate.
 var (
@@ -84,6 +87,16 @@ func (e *DriftError) Error() string {
 
 // Is enables errors.Is(err, ErrDriftThreshold).
 func (e *DriftError) Is(target error) bool { return target == ErrDriftThreshold }
+
+// InterpolatedRate linearly interpolates the body angular velocity at time t
+// between the two bracketing samples. It is the single interpolation rule
+// used both by ordinary RK4 steps and by history queries into a stateful
+// trajectory, so splitting a series at packet boundaries can never change the
+// numbers. Samples with duration 0 are guarded by the caller, so division by
+// zero cannot occur here.
+func InterpolatedRate(a, b Sample, t float64) [3]float64 {
+	return omegaAt(a, b, t)
+}
 
 // omegaAt linearly interpolates the body angular velocity at time t between
 // the two bracketing samples. Samples with duration 0 are guarded by the
@@ -141,6 +154,54 @@ func rk4Step(q quaternion.Q, a, b Sample, h float64) quaternion.Q {
 	}
 }
 
+// StepResult holds the diagnostics of one RK4 step. Raw is the quaternion
+// produced by RK4 before renormalization; callers renormalize it themselves
+// (Simulate and the stateful trajectory engine both normalize identically).
+type StepResult struct {
+	Raw          quaternion.Q
+	RawNorm      float64 // |Raw| before renormalization
+	NormDrift    float64 // ||Raw|-1| of the raw RK4 result
+	StepDuration float64
+	AngularSpeed float64 // |ω| at the end sample
+}
+
+// Step advances the attitude from q by one classical RK4 step of duration
+// h=b.T-a.T, with angular velocity linearly interpolated between the two
+// bracketing samples. It performs no policy decisions (no warning, no
+// rejection, no renormalization): this is the single numerical core shared by
+// Simulate and by the stateful trajectory engine, so both paths produce
+// bit-for-bit identical quaternions for the same samples.
+//
+// A non-positive (or NaN) step duration is rejected. The caller is expected to
+// have validated the samples; Step still guards the duration.
+func Step(q quaternion.Q, a, b Sample) (StepResult, error) {
+	h := b.T - a.T
+	if !(h > 0) { // rejects h <= 0 and NaN durations alike
+		return StepResult{}, ErrNonPositiveStep
+	}
+	raw := rk4Step(q, a, b, h)
+	rawNorm := quaternion.Norm(raw)
+	speed := math.Sqrt(
+		b.W[0]*b.W[0] + b.W[1]*b.W[1] + b.W[2]*b.W[2])
+	return StepResult{
+		Raw:          raw,
+		RawNorm:      rawNorm,
+		NormDrift:    math.Abs(rawNorm - 1.0),
+		StepDuration: h,
+		AngularSpeed: speed,
+	}, nil
+}
+
+// DriftWarningMessage renders the canonical Chinese/English diagnostic line
+// appended to warnings when a step's norm drift exceeds the threshold.
+// Simulate and the trajectory engine must report the exact same wording.
+func DriftWarningMessage(step int, drift, threshold float64) string {
+	return "step " + itoa(step) +
+		": quaternion norm drift " + formatFloat(drift) +
+		" exceeded threshold " + formatFloat(threshold) +
+		" (quaternion was renormalized; consider smaller steps)"
+}
+
 // Simulate integrates the attitude from q0 along samples. Validation of the
 // input (lengths, non-positive steps, unit initial quaternion) is the
 // validation package's responsibility; this function assumes well-formed
@@ -163,14 +224,14 @@ func Simulate(q0 quaternion.Q, samples []Sample, opts Options) (*Result, error) 
 	q := q0
 	for i := 1; i < len(samples); i++ {
 		a, b := samples[i-1], samples[i]
-		h := b.T - a.T
-		if !(h > 0) { // rejects h <= 0 and NaN durations alike
-			return nil, ErrNonPositiveStep
-		}
 
-		raw := rk4Step(q, a, b, h)
-		rawNorm := quaternion.Norm(raw)
-		drift := math.Abs(rawNorm - 1.0)
+		// One numerical core: Simulate drives its steps through the same Step
+		// used by the stateful trajectory engine.
+		sr, err := Step(q, a, b)
+		if err != nil {
+			return nil, err
+		}
+		drift := sr.NormDrift
 		if drift > res.MaxDrift {
 			res.MaxDrift = drift
 		}
@@ -179,29 +240,24 @@ func Simulate(q0 quaternion.Q, samples []Sample, opts Options) (*Result, error) 
 			if opts.StrictDrift {
 				return nil, &DriftError{Step: i, Drift: drift, Threshold: threshold}
 			}
-			if len(res.Warnings) < maxWarnings {
-				res.Warnings = append(res.Warnings, "step "+itoa(i)+
-					": quaternion norm drift "+formatFloat(drift)+
-					" exceeded threshold "+formatFloat(threshold)+
-					" (quaternion was renormalized; consider smaller steps)")
+			if len(res.Warnings) < MaxWarnings {
+				res.Warnings = append(res.Warnings, DriftWarningMessage(i, drift, threshold))
 			}
 		}
 
-		nq, ok := quaternion.Normalized(raw)
+		nq, ok := quaternion.Normalized(sr.Raw)
 		if !ok {
 			return nil, ErrZeroQuaternion
 		}
 		q = nq
 
-		wEnd := b.W
-		speed := math.Sqrt(wEnd[0]*wEnd[0] + wEnd[1]*wEnd[1] + wEnd[2]*wEnd[2])
 		res.Steps = append(res.Steps, StepRecord{
 			T:            b.T,
 			Quaternion:   q,
-			NormBefore:   rawNorm,
+			NormBefore:   sr.RawNorm,
 			NormDrift:    drift,
-			StepDuration: h,
-			AngularSpeed: speed,
+			StepDuration: sr.StepDuration,
+			AngularSpeed: sr.AngularSpeed,
 		})
 	}
 
